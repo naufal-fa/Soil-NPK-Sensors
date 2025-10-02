@@ -3,6 +3,7 @@ use clap::Parser;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serialport::SerialPort;
+use std::io::{Read, Write};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,10 @@ struct Opts {
     /// Retries if CRC/timeout error
     #[arg(long, default_value_t = 2)]
     retries: u8,
+
+    /// Verbose debug (hex-dump requests/responses)
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +84,10 @@ fn crc16_modbus(data: &[u8]) -> u16 {
     crc
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
+}
+
 fn build_read_holding(unit: u8, start: u16, count: u16) -> Vec<u8> {
     let mut frame = vec![unit, 0x03, (start >> 8) as u8, (start & 0xFF) as u8, (count >> 8) as u8, (count & 0xFF) as u8];
     let crc = crc16_modbus(&frame);
@@ -87,9 +96,11 @@ fn build_read_holding(unit: u8, start: u16, count: u16) -> Vec<u8> {
     frame
 }
 
-fn write_and_read(port: &mut dyn SerialPort, req: &[u8], timeout: Duration) -> Result<Vec<u8>> {
+fn write_and_read(port: &mut dyn SerialPort, req: &[u8], timeout: Duration, verbose: bool) -> Result<Vec<u8>> {
     // Flush any stale bytes
     let _ = port.clear(serialport::ClearBuffer::All);
+
+    if verbose { eprintln!("→ TX {} bytes: {}", req.len(), hex(req)); }
 
     port.write_all(req).context("write request")?;
     port.flush().ok();
@@ -102,12 +113,13 @@ fn write_and_read(port: &mut dyn SerialPort, req: &[u8], timeout: Duration) -> R
         let mut tmp = [0u8; 64];
         match port.read(&mut tmp) {
             Ok(n) if n > 0 => {
+                if verbose { eprintln!("← RX {} bytes chunk: {}", n, hex(&tmp[..n])); }
                 buf.extend_from_slice(&tmp[..n]);
                 // Need at least 5 bytes to determine len: unit, func, byte_count, data..., crc_lo, crc_hi
                 if buf.len() >= 5 {
-                    // Check basic header
                     if buf[1] == 0x83 { // exception response
-                        anyhow::bail!("Modbus exception code 0x{:02X}", buf.get(2).copied().unwrap_or(0));
+                        let code = buf.get(2).copied().unwrap_or(0);
+                        anyhow::bail!("Modbus exception (FC=0x83) code=0x{code:02X}");
                     }
                     if buf[1] != 0x03 { /* keep reading; some sensors echo */ }
                     let byte_count = buf[2] as usize;
@@ -118,7 +130,10 @@ fn write_and_read(port: &mut dyn SerialPort, req: &[u8], timeout: Duration) -> R
                         let rx_crc = u16::from_le_bytes([crc_bytes[0], crc_bytes[1]]);
                         let calc_crc = crc16_modbus(payload);
                         if rx_crc != calc_crc {
-                            anyhow::bail!("CRC mismatch: rx=0x{rx_crc:04X} calc=0x{calc_crc:04X}");
+                            anyhow::bail!("CRC mismatch: rx=0x{rx_crc:04X} calc=0x{calc_crc:04X}; payload={} ", hex(payload));
+                        }
+                        if verbose {
+                            eprintln!("✓ Valid payload ({} bytes) byte_count={}", payload.len(), byte_count);
                         }
                         return Ok(payload.to_vec());
                     }
@@ -134,11 +149,12 @@ fn write_and_read(port: &mut dyn SerialPort, req: &[u8], timeout: Duration) -> R
     anyhow::bail!("timeout waiting for response")
 }
 
-fn read_registers_u16(port: &mut dyn SerialPort, unit: u8, addr: u16, count: u16, timeout: Duration, retries: u8) -> Result<Vec<u16>> {
+fn read_registers_u16(port: &mut dyn SerialPort, unit: u8, addr: u16, count: u16, timeout: Duration, retries: u8, verbose: bool) -> Result<Vec<u16>> {
     let req = build_read_holding(unit, addr, count);
     let mut last_err: Option<anyhow::Error> = None;
-    for _ in 0..=retries {
-        match write_and_read(port, &req, timeout) {
+    for attempt in 0..=retries {
+        if verbose { eprintln!("[{}] Read FC=03 addr=0x{:04X} count={} ...", attempt + 1, addr, count); }
+        match write_and_read(port, &req, timeout, verbose) {
             Ok(payload) => {
                 let byte_count = payload[2] as usize;
                 if byte_count % 2 != 0 { anyhow::bail!("invalid byte count {byte_count}"); }
@@ -148,9 +164,11 @@ fn read_registers_u16(port: &mut dyn SerialPort, unit: u8, addr: u16, count: u16
                     let lo = payload[i + 1] as u16;
                     out.push((hi << 8) | lo);
                 }
+                if verbose { eprintln!("→ Words: {:?}", out); }
                 return Ok(out);
             }
             Err(e) => {
+                if verbose { eprintln!("! Attempt failed: {:#}", e); }
                 last_err = Some(e);
                 thread::sleep(Duration::from_millis(100));
             }
@@ -166,7 +184,6 @@ fn as_value(words: &[u16], swap_words: bool) -> f32 {
         2 => {
             let (w0, w1) = if swap_words { (words[1], words[0]) } else { (words[0], words[1]) };
             let u = ((w0 as u32) << 16) | (w1 as u32);
-            // Try interpreting as IEEE754 float; if it's not a sane float, also return as integer
             let f = f32::from_bits(u);
             if f.is_finite() { f } else { u as f32 }
         }
@@ -174,8 +191,12 @@ fn as_value(words: &[u16], swap_words: bool) -> f32 {
     }
 }
 
-fn main() -> Result<()> {
+fn run() -> Result<()> {
     let opts = Opts::parse();
+
+    if opts.verbose {
+        eprintln!("Opening serial: port={} baud={} 8N1 timeout_ms={}", opts.port, opts.baud, opts.timeout_ms);
+    }
 
     let mut port = serialport::new(&opts.port, opts.baud)
         .timeout(Duration::from_millis(opts.timeout_ms))
@@ -190,9 +211,9 @@ fn main() -> Result<()> {
     loop {
         let timeout = Duration::from_millis(opts.timeout_ms);
 
-        let n_words = read_registers_u16(&mut *port, opts.unit, opts.n_reg, opts.reg_width, timeout, opts.retries)?;
-        let p_words = read_registers_u16(&mut *port, opts.unit, opts.p_reg, opts.reg_width, timeout, opts.retries)?;
-        let k_words = read_registers_u16(&mut *port, opts.unit, opts.k_reg, opts.reg_width, timeout, opts.retries)?;
+        let n_words = read_registers_u16(&mut *port, opts.unit, opts.n_reg, opts.reg_width, timeout, opts.retries, opts.verbose)?;
+        let p_words = read_registers_u16(&mut *port, opts.unit, opts.p_reg, opts.reg_width, timeout, opts.retries, opts.verbose)?;
+        let k_words = read_registers_u16(&mut *port, opts.unit, opts.k_reg, opts.reg_width, timeout, opts.retries, opts.verbose)?;
 
         let n = as_value(&n_words, opts.swap_words);
         let p = as_value(&p_words, opts.swap_words);
@@ -225,4 +246,18 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// cargo run --release -- --port COM5 --baud 4800 --unit 1 --n-reg 30 --p-reg 31 --k-reg 32
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("ERROR: {:#}", e);
+        // Print error sources if any
+        let mut source = e.source();
+        while let Some(s) = source {
+            eprintln!("  caused by: {}", s);
+            source = s.source();
+        }
+        eprintln!("(Tip: run with --verbose for hex-dump & details)");
+        std::process::exit(1);
+    }
+}
+
+// C:\Users\ASUS\AppData\Local\Temp\cargo-installOCOm5V\release\npk-reader.exe --port COM6 --baud 9600 --unit 1 --n-reg 30 --p-reg 31 --k-reg 32 --reg-width 1 --interval 10 --verbose
